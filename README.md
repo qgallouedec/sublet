@@ -20,6 +20,41 @@ pip install sublet
 
 A C compiler (gcc or clang) is needed at install time; no CUDA toolkit.
 
+### Experimental ROCm/HIP support
+
+With a ROCm PyTorch build and ROCm development headers/runtime installed:
+
+```bash
+SUBLET_BUILD_HIP=1 ROCM_PATH=/opt/rocm python -m pip install --no-deps .
+```
+
+Both backends use a C compiler; neither nvcc nor hipcc is required. The default
+`SUBLET_BUILD_HIP=auto` includes HIP when headers exist under `$ROCM_PATH/include`
+(default `/opt/rocm/include`); `SUBLET_BUILD_HIP=0` builds CUDA only. HIP links to
+`libamdhip64` under that installation. Runtime selection follows `torch.version.hip`;
+continue to use `device="cuda"` on AMD. The hook targets `libc10_hip.so` and its
+`hipMalloc`/`hipFree` calls.
+
+HIP requires virtual-memory support and an allocation granularity dividing 2 MiB.
+Large-BAR devices also need CPU access to VMM mappings for PyTorch's scalar reads.
+Surviving allocations move out through a pinned host buffer bounded to 64 MiB:
+direct device-to-device copies between VMM aliases failed the optimizer-state
+integrity test on the tested HIP runtime. This adds transfer overhead to move-out.
+CUDA continues to use device-to-device copies.
+
+Validated locally on Radeon 890M (`gfx1150`), torch `2.15.0+rocm10.0` (HIP
+`7.15.26333`), Python 3.14, with `/opt/rocm` HIP `7.16.26385` headers. Other AMD
+GPUs and multi-GPU operation have not been validated. To build and test locally:
+
+```bash
+SUBLET_BUILD_HIP=1 ROCM_PATH=/opt/rocm python setup.py build_ext --inplace
+PYTHONPATH=src python -m pytest tests/test_hip.py tests/test_sublet.py tests/test_workloads.py -q
+```
+
+Tests that deliberately fill nearly all GPU memory skip by default on Radeon
+integrated graphics, whose RAM is shared with the host. Set
+`SUBLET_TEST_MEMORY_PRESSURE=1` to opt into those tests.
+
 ## Example
 
 ```python
@@ -80,8 +115,8 @@ refuses `expandable_segments` (the caching allocator then maps memory itself, wi
 - The borrower's allocations still alive when the loan ends need free GPU memory to move to. Without it, the loan ends
   with `LeakError`: the kept data is back all the same, but those allocations no longer hold data.
 - The owner must not use the tensor during a loan, and one loan per device runs at a time.
-- Linux and CUDA only, with PyTorch's caching allocator calling `cudaMalloc` from `libc10_cuda.so`, as the PyTorch
-  wheels do.
+- Linux and CUDA, plus experimental ROCm/HIP as described above. PyTorch's caching allocator must call
+  `cudaMalloc` from `libc10_cuda.so`, or `hipMalloc` from `libc10_hip.so`, as the corresponding wheels do.
 
 ## License
 

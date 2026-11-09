@@ -30,6 +30,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef SUBLET_HIP
+#include "_hip.h"
+#else
 typedef unsigned long long CUdeviceptr;
 typedef unsigned long long CUmemGenericAllocationHandle;
 typedef int CUresult;
@@ -89,6 +92,18 @@ int sublet_init(void) {
   return 0;
 }
 
+#endif  // SUBLET_HIP
+
+#ifdef SUBLET_HIP
+#define ALLOCATOR_LIBRARY "libc10_hip.so"
+#define RUNTIME_LIBRARY "libamdhip64.so"
+#define RUNTIME_SYMBOL(name) "hip" name
+#else
+#define ALLOCATOR_LIBRARY "libc10_cuda.so"
+#define RUNTIME_LIBRARY "libcudart.so"
+#define RUNTIME_SYMBOL(name) "cuda" name
+#endif
+
 #define PAGE (2ull * 1024 * 1024)
 #define CHUNK 32  // CPU slots per chunk of pinned memory (64 MiB)
 #define MAX_DEVICES 64
@@ -143,14 +158,14 @@ static CUmemAllocationProp device_memory(int device) {
   return prop;
 }
 
-static void allow_access(CUdeviceptr ptr, size_t size, int device) {
+static int allow_access(CUdeviceptr ptr, size_t size, int device) {
   CUmemAccessDesc access = {.location = {.type = 1, .id = device}, .flags = 3};
-  cuMemSetAccess(ptr, size, &access, 1);
+  return cuMemSetAccess(ptr, size, &access, 1);
 }
 
 // Makes r's device current on the calling thread, which may be using another one; returns the context to restore.
 static CUcontext enter(Region* r) {
-  CUcontext previous = NULL;
+  CUcontext previous = 0;
   cuCtxGetCurrent(&previous);
   cuCtxSetCurrent(r->ctx);
   return previous;
@@ -163,7 +178,10 @@ static int map_pages(Region* r, CUdeviceptr ptr, const int64_t* page, int64_t fi
       if (i) cuMemUnmap(ptr, i * PAGE);
       return -1;
     }
-  allow_access(ptr, n * PAGE, r->device);
+  if (allow_access(ptr, n * PAGE, r->device) != 0) {
+    cuMemUnmap(ptr, n * PAGE);
+    return -1;
+  }
   return 0;
 }
 
@@ -194,7 +212,7 @@ int sublet_cuda_free(void* ptr);
 // (its global offset table) to sublet's, and sets *(int*)found to 1 once both are rewritten.
 static int patch_library(struct dl_phdr_info* info, size_t size, void* found) {
   (void)size;
-  if (!info->dlpi_name || !strstr(info->dlpi_name, "libc10_cuda.so")) return 0;
+  if (!info->dlpi_name || !strstr(info->dlpi_name, ALLOCATOR_LIBRARY)) return 0;
   ElfW(Dyn)* dyn = NULL;
   for (int i = 0; i < info->dlpi_phnum; i++)
     if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (ElfW(Dyn)*)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
@@ -219,12 +237,12 @@ static int patch_library(struct dl_phdr_info* info, size_t size, void* found) {
   // The real functions, from the CUDA runtime it links to
   void* cudart = NULL;
   for (int i = 0; i < nneeded && !cudart; i++)
-    if (!strncmp(strtab + needed[i], "libcudart.so", 12)) cudart = dlopen(strtab + needed[i], RTLD_NOW | RTLD_NOLOAD);
+    if (!strncmp(strtab + needed[i], RUNTIME_LIBRARY, strlen(RUNTIME_LIBRARY))) cudart = dlopen(strtab + needed[i], RTLD_NOW | RTLD_NOLOAD);
   if (!cudart) return 1;
-  real_malloc = (cuda_malloc_t)dlsym(cudart, "cudaMalloc");
-  real_free = (cuda_free_t)dlsym(cudart, "cudaFree");
-  real_get_device = (cuda_int_t)dlsym(cudart, "cudaGetDevice");
-  real_exchange_capture_mode = (cuda_int_t)dlsym(cudart, "cudaThreadExchangeStreamCaptureMode");
+  real_malloc = (cuda_malloc_t)dlsym(cudart, RUNTIME_SYMBOL("Malloc"));
+  real_free = (cuda_free_t)dlsym(cudart, RUNTIME_SYMBOL("Free"));
+  real_get_device = (cuda_int_t)dlsym(cudart, RUNTIME_SYMBOL("GetDevice"));
+  real_exchange_capture_mode = (cuda_int_t)dlsym(cudart, RUNTIME_SYMBOL("ThreadExchangeStreamCaptureMode"));
   if (!real_malloc || !real_free || !real_get_device || !real_exchange_capture_mode) return 1;
   for (int i = 0; i < nneeded && !log_level; i++)
     if (!strcmp(strtab + needed[i], "libc10.so")) {
@@ -238,8 +256,8 @@ static int patch_library(struct dl_phdr_info* info, size_t size, void* found) {
       ElfW(Rela)* rel = &tables[t][k];
       if (ELF64_R_TYPE(rel->r_info) != JUMP_SLOT && ELF64_R_TYPE(rel->r_info) != GLOB_DAT) continue;
       const char* name = strtab + symtab[ELF64_R_SYM(rel->r_info)].st_name;
-      void* hook = !strcmp(name, "cudaMalloc") ? (void*)sublet_cuda_malloc
-                   : !strcmp(name, "cudaFree") ? (void*)sublet_cuda_free
+      void* hook = !strcmp(name, RUNTIME_SYMBOL("Malloc")) ? (void*)sublet_cuda_malloc
+                   : !strcmp(name, RUNTIME_SYMBOL("Free")) ? (void*)sublet_cuda_free
                                                : NULL;
       if (!hook) continue;
       void** slot = (void**)(info->dlpi_addr + rel->r_offset);
@@ -307,7 +325,7 @@ Region* sublet_create(int device, size_t nbytes) {
       r->nmapped = p + 1;
     }
   }
-  if (!failed) allow_access(r->base, nbytes, device), allow_access(r->arena, nbytes, device);
+  if (!failed) failed = allow_access(r->base, nbytes, device) != 0 || allow_access(r->arena, nbytes, device) != 0;
   cuCtxSetCurrent(previous);
   if (failed) destroy(r), r = NULL;
   return r;
@@ -631,14 +649,17 @@ int64_t sublet_move_out(Region* r, uint64_t* stuck, int64_t cap) {
     int ok = cuMemCreate(&s->handle, size, &prop, 0) == 0;
     if (ok && cuMemAddressReserve(&staging, size, 0, 0, 0) != 0) cuMemRelease(s->handle), ok = 0;
     if (ok && cuMemMap(staging, size, 0, s->handle, 0) != 0) cuMemAddressFree(staging, size), cuMemRelease(s->handle), ok = 0;
+    if (ok && (allow_access(staging, size, r->device) != 0 ||
+               cuMemcpyDtoDAsync(staging, s->ptr, size, r->copy_stream) != 0 ||
+               cuStreamSynchronize(r->copy_stream) != 0)) {
+      cuMemUnmap(staging, size), cuMemAddressFree(staging, size), cuMemRelease(s->handle);
+      ok = 0;
+    }
     if (!ok) {
       if (nstuck < cap) stuck[nstuck] = s->ptr;
       nstuck++;
       continue;
     }
-    allow_access(staging, size, r->device);
-    cuMemcpyDtoDAsync(staging, s->ptr, size, r->copy_stream);
-    cuStreamSynchronize(r->copy_stream);
     cuMemUnmap(staging, size), cuMemAddressFree(staging, size);
     cuMemUnmap(s->ptr, size);
     cuMemMap(s->ptr, size, 0, s->handle, 0);

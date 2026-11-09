@@ -19,12 +19,17 @@ _active = {}  # device index -> Loan
 def _load():
     global _lib
     if _lib is None:
-        spec = importlib.util.find_spec("sublet._allocator")
+        backend = "HIP" if torch.version.hip else "CUDA"
+        module = "sublet._allocator_hip" if torch.version.hip else "sublet._allocator"
+        spec = importlib.util.find_spec(module)
         if spec is None:
-            raise ImportError("sublet's allocator library is missing: install sublet with pip so that it gets compiled")
+            raise ImportError(
+                f"sublet's {backend} allocator library is missing: reinstall with pip"
+                + (" using SUBLET_BUILD_HIP=1 ROCM_PATH=/opt/rocm" if torch.version.hip else "")
+            )
         lib = ctypes.CDLL(spec.origin)
         if lib.sublet_init() != 0:
-            raise RuntimeError("sublet could not load the CUDA driver (libcuda.so.1)")
+            raise RuntimeError(f"sublet could not initialize the {backend} driver")
         p, address = ctypes.c_void_p, ctypes.c_uint64
         lib.sublet_create.argtypes, lib.sublet_create.restype = [ctypes.c_int, ctypes.c_size_t], p
         lib.sublet_destroy.argtypes = [p]
@@ -38,8 +43,7 @@ def _load():
         lib.sublet_end.argtypes = [p, p, p]
         if lib.sublet_hook() != 0:
             raise RuntimeError(
-                "sublet could not reach the cudaMalloc and cudaFree calls of PyTorch's caching allocator (in "
-                "libc10_cuda.so, linked to libcudart): this PyTorch build is not supported"
+                f"sublet could not hook PyTorch's {backend} caching allocator: this PyTorch build is not supported"
             )
         _lib = lib
     return _lib

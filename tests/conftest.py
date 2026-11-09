@@ -1,5 +1,6 @@
 import contextlib
 import gc
+import os
 
 import pytest
 import torch
@@ -35,6 +36,8 @@ def make_cache(rows=16, device=dev):
 @contextlib.contextmanager
 def gpu_filled(leave):
     """Inside, all free GPU memory but about `leave` bytes is taken."""
+    if torch.version.hip and "Graphics" in torch.cuda.get_device_name() and not os.getenv("SUBLET_TEST_MEMORY_PRESSURE"):
+        pytest.skip("integrated GPU shares host RAM; set SUBLET_TEST_MEMORY_PRESSURE=1 for memory-pressure tests")
     # CUDA loads a kernel the first time it runs, into GPU memory: load those the tests run, while there is room
     x = torch.empty(4 * MiB, dtype=torch.uint8, device=dev)
     x.fill_(1), torch.full_like(x, 2), x.view(torch.int64).random_(), (x == 1).all(), x.clone()
